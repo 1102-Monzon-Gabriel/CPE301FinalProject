@@ -1,0 +1,287 @@
+
+#include <Arduino.h>
+#include <IRremote.hpp>
+#include <LiquidCrystal.h>
+
+#define DHT_PIN A0
+const int RECV_PIN = 6;
+const int FAN_PIN = 9;
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+// =====================================================
+// GLOBAL VARIABLES
+// =====================================================
+int targetTemp = 25;
+int currentTemp = 0;
+bool isSystemOn = true;
+
+unsigned long lastDHTRead = 0;
+const unsigned long interval = 2000;
+
+// =====================================================
+// PORT REGISTER DEFINITIONS
+// =====================================================
+// FAN_PIN = 9 on Arduino Mega
+// Pin 9 = PH6
+
+#define FAN_DDR   DDRH
+#define FAN_PORT  PORTH
+#define FAN_BIT   PH6
+
+// DHT_PIN = A0 on Arduino Mega
+// A0 = PF0
+
+#define DHT_DDR   DDRF
+#define DHT_PORT  PORTF
+#define DHT_PINR  PINF
+#define DHT_BIT   PF0
+
+// =====================================================
+// FUNCTION PROTOTYPES
+// =====================================================
+void readDHT();
+void checkFanLogic();
+void updateDisplay();
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Set FAN pin as OUTPUT using register manipulation
+  FAN_DDR |= (1 << FAN_BIT);
+
+  // Fan OFF initially
+  FAN_PORT &= ~(1 << FAN_BIT);
+
+  IrReceiver.begin(RECV_PIN, ENABLE_LED_FEEDBACK);
+
+  lcd.begin(16, 2);
+
+  lcd.print("System Ready");
+  delay(1000);
+  lcd.clear();
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+
+  // =============================================
+  // 1. IR REMOTE HANDLING
+  // =============================================
+  if (IrReceiver.decode()) {
+
+    uint16_t command = IrReceiver.decodedIRData.command;
+
+    Serial.println(command, HEX);
+
+    // POWER BUTTON
+    if (command == 0x45) {
+
+      isSystemOn = !isSystemOn;
+
+      // Safety shutdown
+      if (!isSystemOn) {
+        FAN_PORT &= ~(1 << FAN_BIT);
+      }
+    }
+
+    // =========================================
+    // Only allow controls when system ON
+    // =========================================
+    if (isSystemOn) {
+
+      switch (command) {
+
+        case 0x46:   // Increase temperature
+          targetTemp++;
+          break;
+
+        case 0x15:   // Decrease temperature
+          targetTemp--;
+          break;
+
+        case 0x47:   // Reset button
+          targetTemp = 25;
+
+          lcd.clear();
+          lcd.print("Resetting...");
+          delay(500);
+          break;
+      }
+    }
+
+    updateDisplay();
+
+    IrReceiver.resume();
+  }
+
+  // =============================================
+  // 2. SYSTEM LOGIC
+  // =============================================
+  if (isSystemOn) {
+
+    if (millis() - lastDHTRead >= interval) {
+
+      readDHT();
+
+      checkFanLogic();
+
+      updateDisplay();
+
+      lastDHTRead = millis();
+    }
+  }
+  else {
+
+    if (millis() - lastDHTRead >= interval) {
+
+      updateDisplay();
+
+      lastDHTRead = millis();
+    }
+  }
+}
+
+// =====================================================
+// DHT SENSOR READ FUNCTION
+// =====================================================
+void readDHT() {
+
+  byte data[5] = {0, 0, 0, 0, 0};
+
+  // =============================================
+  // Start signal to DHT sensor
+  // =============================================
+
+  // Set pin as OUTPUT
+  DHT_DDR |= (1 << DHT_BIT);
+
+  // Pull LOW for 18ms
+  DHT_PORT &= ~(1 << DHT_BIT);
+  delay(18);
+
+  // Pull HIGH
+  DHT_PORT |= (1 << DHT_BIT);
+  delayMicroseconds(40);
+
+  // Set as INPUT
+  DHT_DDR &= ~(1 << DHT_BIT);
+
+  // =============================================
+  // Wait for DHT response
+  // =============================================
+
+  unsigned long timeout = micros();
+
+  while (DHT_PINR & (1 << DHT_BIT)) {
+    if (micros() - timeout > 1000) {
+      return;
+    }
+  }
+
+  while (!(DHT_PINR & (1 << DHT_BIT)));
+  while (DHT_PINR & (1 << DHT_BIT));
+
+  // =============================================
+  // Read 40 bits
+  // =============================================
+
+  for (int i = 0; i < 40; i++) {
+
+    while (!(DHT_PINR & (1 << DHT_BIT)));
+
+    unsigned long start = micros();
+
+    while (DHT_PINR & (1 << DHT_BIT));
+
+    unsigned long duration = micros() - start;
+
+    data[i / 8] <<= 1;
+
+    if (duration > 40) {
+      data[i / 8] |= 1;
+    }
+  }
+
+  // =============================================
+  // Checksum validation
+  // =============================================
+
+  if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+
+    currentTemp = data[2];
+  }
+}
+
+// =====================================================
+// FAN CONTROL LOGIC
+// =====================================================
+void checkFanLogic() {
+
+  if (currentTemp >= targetTemp) {
+
+    // FAN ON using register manipulation
+    FAN_PORT |= (1 << FAN_BIT);
+  }
+  else {
+
+    // FAN OFF using register manipulation
+    FAN_PORT &= ~(1 << FAN_BIT);
+  }
+}
+
+// =====================================================
+// LCD DISPLAY FUNCTION
+// =====================================================
+void updateDisplay() {
+
+  lcd.setCursor(0, 0);
+
+  // =============================================
+  // SYSTEM OFF SCREEN
+  // =============================================
+  if (!isSystemOn) {
+
+    lcd.print("SYSTEM: OFF     ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Press PWR to ON ");
+
+    return;
+  }
+
+  // =============================================
+  // LINE 1 - CURRENT TEMP
+  // =============================================
+
+  lcd.print("Temp: ");
+  lcd.print(currentTemp);
+  lcd.print((char)223);
+  lcd.print("C    ");
+
+  // =============================================
+  // LINE 2 - TARGET TEMP + FAN STATUS
+  // =============================================
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("Set: ");
+  lcd.print(targetTemp);
+  lcd.print((char)223);
+  lcd.print("C ");
+
+  // Check fan state directly from register
+  if (PORTH & (1 << FAN_BIT)) {
+
+    lcd.print("[FAN]");
+  }
+  else {
+
+    lcd.print("     ");
+  }
+}
