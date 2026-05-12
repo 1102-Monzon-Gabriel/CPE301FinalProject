@@ -1,287 +1,308 @@
 
+//Jordan Perone and Gabe Monzon
+
 #include <Arduino.h>
 #include <IRremote.hpp>
 #include <LiquidCrystal.h>
 
-#define DHT_PIN A0
-const int RECV_PIN = 6;
+// 
+//Port and Register stuff for the circuit and arduino locatoins 
+#define FAN_DDR   DDRH
+#define FAN_port  PORTH
+#define FAN_num   PH6
+
+#define SENSOR_DDR   DDRF
+#define SENSOR_port  PORTF
+#define SENSOR_pin   PINF
+#define SENSOR_num   PF0
+
+#define DHT_ANApin A0 //temperature sensor location(analog)
+
+const int IR_dp = 6;
 const int FAN_PIN = 9;
 
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
 
-// =====================================================
-// GLOBAL VARIABLES
-// =====================================================
-int targetTemp = 25;
-int currentTemp = 0;
-bool isSystemOn = true;
+// 
+// for system states
+// 
+int UserTemp = 25;
+int TempRoom = 0;
+bool systemOn = true;
 
-unsigned long lastDHTRead = 0;
-const unsigned long interval = 2000;
+unsigned long lastSensorUpdate = 0;
+const unsigned long updateInterval = 2000;
 
-// =====================================================
-// PORT REGISTER DEFINITIONS
-// =====================================================
-// FAN_PIN = 9 on Arduino Mega
-// Pin 9 = PH6
+// Using pin 20 as our ISR to interrupt the system// 
+volatile bool ISRbut = false;
+volatile unsigned long earlyTime = 0;
+const unsigned long debLay = 200;
 
-#define FAN_DDR   DDRH
-#define FAN_PORT  PORTH
-#define FAN_BIT   PH6
+// 
+// UART
+// 
+void uartBegin() {
+  uint16_t UARTtime = 8;
 
-// DHT_PIN = A0 on Arduino Mega
-// A0 = PF0
+  UBRR0H = (UARTtime >> 8);
+  UBRR0L = UARTtime;
 
-#define DHT_DDR   DDRF
-#define DHT_PORT  PORTF
-#define DHT_PINR  PINF
-#define DHT_BIT   PF0
+  UCSR0B = (1 << TXEN0);
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
 
-// =====================================================
-// FUNCTION PROTOTYPES
-// =====================================================
-void readDHT();
-void checkFanLogic();
-void updateDisplay();
+void sendChar(char c) {
+  while (!(UCSR0A & (1 << UDRE0)));
+  UDR0 = c;
+}
 
-// =====================================================
-// SETUP
-// =====================================================
+void SendSent(const char* text) {
+  while (*text) sendChar(*text++);
+}
+
+void SendNum(int value) {
+  char buffer[10];
+  itoa(value, buffer, 10);
+  SendSent(buffer);
+}
+
+void enter() {
+  sendChar('\r');
+  sendChar('\n');
+}
+
+// 
+// Function callsl
+// 
+void readTemperatureSensor();
+void Fan();
+void LCDscreen();
+void Serialprint();
+
+// 
+// ISR (PIN 20 BUTTON)
+// 
+void ISR_pin20() {
+  unsigned long now = millis();
+
+  if (now - earlyTime > debLay) {
+    ISRbut = true;
+    earlyTime = now;
+  }
+}
+
+
+// 
 void setup() {
-  Serial.begin(115200);
 
-  // Set FAN pin as OUTPUT using register manipulation
-  FAN_DDR |= (1 << FAN_BIT);
+  uartBegin(); // start with UARt first
 
-  // Fan OFF initially
-  FAN_PORT &= ~(1 << FAN_BIT);
+  FAN_DDR |= (1 << FAN_num);
+  FAN_port &= ~(1 << FAN_num);
 
-  IrReceiver.begin(RECV_PIN, ENABLE_LED_FEEDBACK);
+  IrReceiver.begin(IR_dp, ENABLE_LED_FEEDBACK);
 
   lcd.begin(16, 2);
 
-  lcd.print("System Ready");
+  pinMode(20, INPUT_PULLUP);
+
+  
+  attachInterrupt(digitalPinToInterrupt(20), ISR_pin20, FALLING);
+
+  lcd.print("Starting system");
+  SendSent("System is starting...\r\n");
+
   delay(1000);
   lcd.clear();
 }
 
-// =====================================================
-// MAIN LOOP
-// =====================================================
+
 void loop() {
 
-  // =============================================
-  // 1. IR REMOTE HANDLING
-  // =============================================
+  // 
+  // ISR button pressing. Trying to get it to interrupt and save the information we are using at the time of reset.
+  // 
+  if (ISRbut) {
+    ISRbut = false;
+
+    SendSent("Button ISR triggered (PIN 20)\r\n");
+    enter();
+
+    systemOn = !systemOn;
+
+    if (!systemOn) {
+      FAN_port &= ~(1 << FAN_num);
+      SendSent("System turned OFF via button\r\n");
+    } else {
+      SendSent("System turned ON via button\r\n");
+    }
+
+    LCDscreen();
+  }
+
+  // 
+  // IR remote stuffy trying to get it to workl
+  // 
   if (IrReceiver.decode()) {
 
-    uint16_t command = IrReceiver.decodedIRData.command;
+    uint16_t code = IrReceiver.decodedIRData.command;
 
-    Serial.println(command, HEX);
+    SendSent("Remote input received: ");
+    SendNum(code);
+    enter();
 
-    // POWER BUTTON
-    if (command == 0x45) {
+    if (code == 0x45) {
+      systemOn = !systemOn;
 
-      isSystemOn = !isSystemOn;
-
-      // Safety shutdown
-      if (!isSystemOn) {
-        FAN_PORT &= ~(1 << FAN_BIT);
+      if (!systemOn) {
+        FAN_port &= ~(1 << FAN_num);
+        SendSent("System turned OFF\r\n");
+      } else {
+        SendSent("System turned ON\r\n");
       }
     }
 
-    // =========================================
-    // Only allow controls when system ON
-    // =========================================
-    if (isSystemOn) {
+    if (systemOn) {
 
-      switch (command) {
+      if (code == 0x46) UserTemp++;
+      if (code == 0x15) UserTemp--;
 
-        case 0x46:   // Increase temperature
-          targetTemp++;
-          break;
-
-        case 0x15:   // Decrease temperature
-          targetTemp--;
-          break;
-
-        case 0x47:   // Reset button
-          targetTemp = 25;
-
-          lcd.clear();
-          lcd.print("Resetting...");
-          delay(500);
-          break;
+      if (code == 0x47) {
+        UserTemp = 25;
+        lcd.clear();
+        lcd.print("Resetting...");
+        SendSent("Target temperature reset\r\n");
+        delay(500);
       }
     }
 
-    updateDisplay();
-
+    LCDscreen();
     IrReceiver.resume();
   }
 
-  // =============================================
-  // 2. SYSTEM LOGIC
-  // =============================================
-  if (isSystemOn) {
+  // 
+  // Sensors updating temperature data and other variables/devices
+  // 
+  if (systemOn && millis() - lastSensorUpdate > updateInterval) {
 
-    if (millis() - lastDHTRead >= interval) {
+    readTemperatureSensor();
+    Fan();
+    LCDscreen();
+    Serialprint();
 
-      readDHT();
-
-      checkFanLogic();
-
-      updateDisplay();
-
-      lastDHTRead = millis();
-    }
+    lastSensorUpdate = millis();
   }
-  else {
 
-    if (millis() - lastDHTRead >= interval) {
+  if (!systemOn && millis() - lastSensorUpdate > updateInterval) {
 
-      updateDisplay();
+    LCDscreen();
+    Serialprint();
 
-      lastDHTRead = millis();
-    }
+    lastSensorUpdate = millis();
   }
 }
 
-// =====================================================
-// DHT SENSOR READ FUNCTION
-// =====================================================
-void readDHT() {
+// 
+// Temperature sensor is buggy trying to fix with port manipulation
+ 
+void readTemperatureSensor() {
 
-  byte data[5] = {0, 0, 0, 0, 0};
+  byte data[5] = {0};
 
-  // =============================================
-  // Start signal to DHT sensor
-  // =============================================
-
-  // Set pin as OUTPUT
-  DHT_DDR |= (1 << DHT_BIT);
-
-  // Pull LOW for 18ms
-  DHT_PORT &= ~(1 << DHT_BIT);
+  SENSOR_DDR |= (1 << SENSOR_num);
+  SENSOR_port &= ~(1 << SENSOR_num);
   delay(18);
 
-  // Pull HIGH
-  DHT_PORT |= (1 << DHT_BIT);
+  SENSOR_port |= (1 << SENSOR_num);
   delayMicroseconds(40);
 
-  // Set as INPUT
-  DHT_DDR &= ~(1 << DHT_BIT);
+  SENSOR_DDR &= ~(1 << SENSOR_num);
 
-  // =============================================
-  // Wait for DHT response
-  // =============================================
-
-  unsigned long timeout = micros();
-
-  while (DHT_PINR & (1 << DHT_BIT)) {
-    if (micros() - timeout > 1000) {
-      return;
-    }
-  }
-
-  while (!(DHT_PINR & (1 << DHT_BIT)));
-  while (DHT_PINR & (1 << DHT_BIT));
-
-  // =============================================
-  // Read 40 bits
-  // =============================================
+  while (SENSOR_pin & (1 << SENSOR_num));
+  while (!(SENSOR_pin & (1 << SENSOR_num)));
+  while (SENSOR_pin & (1 << SENSOR_num));
 
   for (int i = 0; i < 40; i++) {
 
-    while (!(DHT_PINR & (1 << DHT_BIT)));
+    while (!(SENSOR_pin & (1 << SENSOR_num)));
 
     unsigned long start = micros();
 
-    while (DHT_PINR & (1 << DHT_BIT));
+    while (SENSOR_pin & (1 << SENSOR_num));
 
     unsigned long duration = micros() - start;
 
     data[i / 8] <<= 1;
 
-    if (duration > 40) {
-      data[i / 8] |= 1;
-    }
+    if (duration > 40) data[i / 8] |= 1;
   }
 
-  // =============================================
-  // Checksum validation
-  // =============================================
-
-  if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
-
-    currentTemp = data[2];
+  if (data[4] == (data[0] + data[1] + data[2] + data[3])) {
+    TempRoom = data[2];
   }
 }
 
-// =====================================================
-// FAN CONTROL LOGIC
-// =====================================================
-void checkFanLogic() {
+// 
+// FAN data saving
+// 
+void Fan() {
 
-  if (currentTemp >= targetTemp) {
-
-    // FAN ON using register manipulation
-    FAN_PORT |= (1 << FAN_BIT);
-  }
-  else {
-
-    // FAN OFF using register manipulation
-    FAN_PORT &= ~(1 << FAN_BIT);
+  if (TempRoom >= UserTemp) {
+    FAN_port |= (1 << FAN_num);
+  } else {
+    FAN_port &= ~(1 << FAN_num);
   }
 }
 
-// =====================================================
-// LCD DISPLAY FUNCTION
-// =====================================================
-void updateDisplay() {
+// 
+// LCD
+// 
+void LCDscreen() {
 
   lcd.setCursor(0, 0);
 
-  // =============================================
-  // SYSTEM OFF SCREEN
-  // =============================================
-  if (!isSystemOn) {
-
-    lcd.print("SYSTEM: OFF     ");
-
+  if (!systemOn) {
+    lcd.print("System: OFF     ");
     lcd.setCursor(0, 1);
-    lcd.print("Press PWR to ON ");
-
+    lcd.print("Press button ON ");
     return;
   }
 
-  // =============================================
-  // LINE 1 - CURRENT TEMP
-  // =============================================
-
   lcd.print("Temp: ");
-  lcd.print(currentTemp);
+  lcd.print(TempRoom);
   lcd.print((char)223);
-  lcd.print("C    ");
-
-  // =============================================
-  // LINE 2 - TARGET TEMP + FAN STATUS
-  // =============================================
+  lcd.print("C   ");
 
   lcd.setCursor(0, 1);
 
-  lcd.print("Set: ");
-  lcd.print(targetTemp);
+  lcd.print("Target: ");
+  lcd.print(UserTemp);
   lcd.print((char)223);
   lcd.print("C ");
 
-  // Check fan state directly from register
-  if (PORTH & (1 << FAN_BIT)) {
-
-    lcd.print("[FAN]");
+  if (PORTH & (1 << FAN_num)) {
+    lcd.print("FAN ON ");
+  } else {
+    lcd.print("FAN OFF");
   }
-  else {
+}
 
-    lcd.print("     ");
-  }
+// Messaging the serial monitor our data using our functions.
+// 
+void Serialprint() {
+
+  SendSent(systemOn ? "ON" : "OFF");
+  enter();
+
+  SendSent("Current temp: ");
+  SendNum(TempRoom);
+  SendSent(" C\r\n");
+
+  SendSent("Target temp: ");
+  SendNum(UserTemp);
+  SendSent(" C\r\n");
+
+  SendSent("Fan state: ");
+  SendSent((PORTH & (1 << FAN_num)) ? "RUNNING" : "STOPPED");
+  enter();
 }
